@@ -1,0 +1,19 @@
+{
+    "id": "com.yourdomain.scheduler",
+    "name": "Message Scheduler",
+    "description": "Schedule messages for later delivery",
+    "version": "0.1.0",
+    "server": {
+        "executables": {
+            "linux-amd64": "server/plugin-linux-amd64"
+        }
+    },
+    "webapp": {
+        "bundle_path": "webapp/com.yourdomain.scheduler_bundle.js"
+    },
+    "settings_schema": {
+        "header": "Configure your message scheduler",
+        "footer": "",
+        "settings": []
+    }
+}

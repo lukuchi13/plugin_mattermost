@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -21,19 +22,21 @@ type ScheduledMessage struct {
 	ChannelID    string    `json:"channel_id"`
 	ChannelName  string    `json:"channel_name"`
 	Message      string    `json:"message"`
+	FileIDs      []string  `json:"file_ids"`      // ID загруженных файлов
+	Filenames    []string  `json:"filenames"`     // Имена файлов для отображения
 	ScheduleTime time.Time `json:"schedule_time"`
 	CreatedAt    time.Time `json:"created_at"`
 	IsSent       bool      `json:"is_sent"`
 }
 
 func (p *Plugin) OnActivate() error {
-	p.API.LogInfo("Scheduler plugin activated")
+	p.API.LogInfo("Плагин планировщика активирован")
 	go p.checkScheduledMessages()
 	return nil
 }
 
 func (p *Plugin) checkScheduledMessages() {
-	p.API.LogInfo("Starting scheduled messages checker")
+	p.API.LogInfo("Запуск проверки запланированных сообщений")
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
@@ -44,15 +47,15 @@ func (p *Plugin) checkScheduledMessages() {
 
 func (p *Plugin) processScheduledMessages() {
 	now := time.Now()
-	p.API.LogDebug("Checking scheduled messages", "time", now.Format("2006-01-02 15:04:05"))
+	p.API.LogDebug("Проверка запланированных сообщений", "time", now.Format("2006-01-02 15:04:05"))
 	
 	keys, appErr := p.API.KVList(0, 1000)
 	if appErr != nil {
-		p.API.LogError("Failed to list KV keys", "error", appErr.Error())
+		p.API.LogError("Не удалось получить список ключей", "error", appErr.Error())
 		return
 	}
 
-	p.API.LogDebug("Found KV keys", "count", len(keys))
+	p.API.LogDebug("Найдено ключей", "count", len(keys))
 
 	for _, key := range keys {
 		var msg ScheduledMessage
@@ -62,11 +65,11 @@ func (p *Plugin) processScheduledMessages() {
 		}
 		
 		if err := json.Unmarshal(data, &msg); err != nil {
-			p.API.LogError("Failed to unmarshal message", "key", key, "error", err.Error())
+			p.API.LogError("Ошибка разбора сообщения", "key", key, "error", err.Error())
 			continue
 		}
 		
-		p.API.LogDebug("Checking message", 
+		p.API.LogDebug("Проверка сообщения", 
 			"id", msg.ID,
 			"channel", msg.ChannelID,
 			"schedule", msg.ScheduleTime.Format("2006-01-02 15:04:05"),
@@ -75,7 +78,7 @@ func (p *Plugin) processScheduledMessages() {
 		
 		// Отправляем если время наступило и еще не отправлено
 		if !msg.IsSent && msg.ScheduleTime.Before(now) {
-			p.API.LogInfo("Time to send message", 
+			p.API.LogInfo("Время отправлять сообщение", 
 				"id", msg.ID,
 				"channel", msg.ChannelID,
 				"scheduled_time", msg.ScheduleTime.Format("2006-01-02 15:04:05"))
@@ -88,9 +91,9 @@ func (p *Plugin) processScheduledMessages() {
 				msg.IsSent = true
 				data, _ := json.Marshal(msg)
 				p.API.KVSet(msg.ID, data)
-				p.API.LogInfo("Message sent and marked as delivered", "id", msg.ID)
+				p.API.LogInfo("Сообщение отправлено и отмечено как доставленное", "id", msg.ID)
 			} else {
-				p.API.LogError("Failed to send message, will retry later", "id", msg.ID)
+				p.API.LogError("Не удалось отправить сообщение, будет повтор через 10 секунд", "id", msg.ID)
 				// НЕ отмечаем как отправленное, чтобы попробовать снова
 			}
 		}
@@ -98,26 +101,27 @@ func (p *Plugin) processScheduledMessages() {
 }
 
 func (p *Plugin) sendScheduledMessage(msg ScheduledMessage) bool {
-	p.API.LogInfo("Attempting to send scheduled message", 
+	p.API.LogInfo("Попытка отправить запланированное сообщение", 
 		"id", msg.ID,
 		"channel", msg.ChannelID,
-		"user", msg.UserID)
+		"user", msg.UserID,
+		"files", len(msg.FileIDs))
 
 	// Проверяем существование канала
 	channel, appErr := p.API.GetChannel(msg.ChannelID)
 	if appErr != nil {
-		p.API.LogError("Channel not found", 
+		p.API.LogError("Канал не найден", 
 			"channel_id", msg.ChannelID, 
 			"error", appErr.Error())
 		
-		p.sendNotification(msg.UserID, fmt.Sprintf("❌ Cannot send scheduled message: channel not found\nMessage: %s", msg.Message))
+		p.sendNotification(msg.UserID, fmt.Sprintf("❌ Не удалось отправить сообщение: канал не найден\nТекст: %s", msg.Message))
 		return false
 	}
 
 	// Проверяем существование пользователя
 	user, appErr := p.API.GetUser(msg.UserID)
 	if appErr != nil {
-		p.API.LogError("User not found", 
+		p.API.LogError("Пользователь не найден", 
 			"user_id", msg.UserID, 
 			"error", appErr.Error())
 		return false
@@ -128,44 +132,47 @@ func (p *Plugin) sendScheduledMessage(msg ScheduledMessage) bool {
 		UserId:    msg.UserID,
 		ChannelId: msg.ChannelID,
 		Message:   msg.Message,
+		FileIds:   msg.FileIDs, // Прикрепляем файлы к посту
 		Props: map[string]interface{}{
-			"scheduled": true,
-			"from_scheduler": true,
+			"scheduled":         true,
+			"from_scheduler":    true,
 			"original_schedule": msg.ScheduleTime.Format("2006-01-02 15:04:05"),
-			"scheduled_by": user.Username,
+			"scheduled_by":      user.Username,
 		},
 	}
 
-	// Добавляем форматирование если нужно
-	if strings.HasPrefix(msg.Message, "```") {
-		// Это код, оставляем как есть
-	} else if strings.HasPrefix(msg.Message, ">") {
-		// Это цитата, оставляем как есть
-	} else {
-		// Обычное сообщение
+	// Если есть файлы, добавляем информацию о них в пропсы
+	if len(msg.Filenames) > 0 {
+		post.Props["attached_files"] = msg.Filenames
 	}
 
 	// Отправляем сообщение
 	createdPost, appErr := p.API.CreatePost(post)
 	if appErr != nil {
-		p.API.LogError("Failed to create post", 
+		p.API.LogError("Не удалось создать пост", 
 			"error", appErr.Error(),
 			"channel", msg.ChannelID,
 			"user", msg.UserID)
 		
-		p.sendNotification(msg.UserID, fmt.Sprintf("❌ Failed to send scheduled message: %s\nMessage: %s", appErr.Error(), msg.Message))
+		p.sendNotification(msg.UserID, fmt.Sprintf("❌ Не удалось отправить сообщение: %s\nТекст: %s", appErr.Error(), msg.Message))
 		return false
 	}
 
 	// Успешно отправили
-	p.API.LogInfo("Scheduled message sent successfully", 
+	p.API.LogInfo("Запланированное сообщение успешно отправлено", 
 		"id", msg.ID,
 		"post_id", createdPost.Id,
-		"channel", channel.Name)
+		"channel", channel.Name,
+		"files", len(msg.FileIDs))
 
 	// Отправляем уведомление об успехе
-	p.sendNotification(msg.UserID, fmt.Sprintf("✅ Your scheduled message has been sent to ~%s!\n> %s", 
-		channel.DisplayName, msg.Message))
+	fileInfo := ""
+	if len(msg.Filenames) > 0 {
+		fileInfo = fmt.Sprintf("\n📎 Вложений: %d", len(msg.Filenames))
+	}
+	
+	p.sendNotification(msg.UserID, fmt.Sprintf("✅ Ваше сообщение отправлено в ~%s!%s\n> %s", 
+		channel.DisplayName, fileInfo, msg.Message))
 	
 	return true
 }
@@ -187,89 +194,167 @@ func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Req
 
 func (p *Plugin) handleSchedule(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
 		return
 	}
 
-	var msg ScheduledMessage
-	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
-		p.API.LogError("Failed to decode schedule request", "error", err.Error())
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	// Парсим multipart form (макс 100MB)
+	err := r.ParseMultipartForm(100 << 20) // 100 MB
+	if err != nil {
+		p.API.LogError("Ошибка парсинга формы", "error", err.Error())
+		http.Error(w, "Ошибка обработки формы: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	p.API.LogInfo("Received schedule request", 
-		"user_id", msg.UserID,
-		"channel_id", msg.ChannelID,
-		"message_length", len(msg.Message),
-		"schedule_time", msg.ScheduleTime)
+	// Получаем данные из формы
+	userID := r.FormValue("user_id")
+	channelID := r.FormValue("channel_id")
+	message := r.FormValue("message")
+	scheduleTimeStr := r.FormValue("schedule_time")
 
-	if msg.Message == "" {
-		http.Error(w, "Message is required", http.StatusBadRequest)
+	p.API.LogInfo("Получен запрос на планирование", 
+		"user_id", userID,
+		"channel_id", channelID,
+		"message_length", len(message),
+		"schedule_time", scheduleTimeStr,
+		"files", len(r.MultipartForm.File))
+
+	// Валидация
+	if userID == "" {
+		http.Error(w, "user_id обязателен", http.StatusBadRequest)
+		return
+	}
+	if channelID == "" {
+		http.Error(w, "channel_id обязателен", http.StatusBadRequest)
+		return
+	}
+	if message == "" && len(r.MultipartForm.File) == 0 {
+		http.Error(w, "Нужно указать текст сообщения или прикрепить файл", http.StatusBadRequest)
 		return
 	}
 
-	if msg.ChannelID == "" {
-		http.Error(w, "Channel ID is required", http.StatusBadRequest)
+	scheduleTime, err := time.Parse(time.RFC3339, scheduleTimeStr)
+	if err != nil {
+		http.Error(w, "Неверный формат времени", http.StatusBadRequest)
 		return
 	}
 
-	if msg.ScheduleTime.Before(time.Now()) {
-		http.Error(w, "Schedule time must be in future", http.StatusBadRequest)
+	if scheduleTime.Before(time.Now()) {
+		http.Error(w, "Время должно быть в будущем", http.StatusBadRequest)
 		return
 	}
 
 	// Проверяем существование канала
-	channel, appErr := p.API.GetChannel(msg.ChannelID)
+	channel, appErr := p.API.GetChannel(channelID)
 	if appErr != nil {
-		p.API.LogError("Invalid channel", 
-			"channel_id", msg.ChannelID, 
+		p.API.LogError("Неверный канал", 
+			"channel_id", channelID, 
 			"error", appErr.Error())
-		http.Error(w, fmt.Sprintf("Invalid channel: %v", appErr.Error()), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("Канал не найден: %v", appErr.Error()), http.StatusBadRequest)
 		return
 	}
-	
-	msg.ChannelName = channel.Name
-	msg.ID = model.NewId()
-	msg.CreatedAt = time.Now()
-	msg.IsSent = false
+
+	// Загружаем файлы если есть
+	var fileIDs []string
+	var filenames []string
+
+	if len(r.MultipartForm.File) > 0 {
+		p.API.LogInfo("Загрузка файлов", "count", len(r.MultipartForm.File))
+		
+		for _, fileHeaders := range r.MultipartForm.File {
+			for _, fileHeader := range fileHeaders {
+				file, err := fileHeader.Open()
+				if err != nil {
+					p.API.LogError("Ошибка открытия файла", "error", err.Error())
+					continue
+				}
+				defer file.Close()
+
+				// Читаем файл в память
+				data, err := io.ReadAll(file)
+				if err != nil {
+					p.API.LogError("Ошибка чтения файла", "error", err.Error())
+					continue
+				}
+
+				// Создаем файл в Mattermost
+				uploadedFile, appErr := p.API.UploadFile(data, channelID, fileHeader.Filename)
+				if appErr != nil {
+					p.API.LogError("Ошибка загрузки файла", 
+						"filename", fileHeader.Filename, 
+						"error", appErr.Error())
+					continue
+				}
+
+				fileIDs = append(fileIDs, uploadedFile.Id)
+				filenames = append(filenames, fileHeader.Filename)
+				p.API.LogInfo("Файл загружен", "filename", fileHeader.Filename, "file_id", uploadedFile.Id)
+			}
+		}
+	}
+
+	// Создаем запланированное сообщение
+	msg := ScheduledMessage{
+		ID:           model.NewId(),
+		UserID:       userID,
+		ChannelID:    channelID,
+		ChannelName:  channel.Name,
+		Message:      message,
+		FileIDs:      fileIDs,
+		Filenames:    filenames,
+		ScheduleTime: scheduleTime,
+		CreatedAt:    time.Now(),
+		IsSent:       false,
+	}
 
 	data, err := json.Marshal(msg)
 	if err != nil {
-		p.API.LogError("Failed to marshal message", "error", err.Error())
+		p.API.LogError("Ошибка маршалинга сообщения", "error", err.Error())
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	if appErr := p.API.KVSet(msg.ID, data); appErr != nil {
-		p.API.LogError("Failed to save message", "error", appErr.Error())
+		p.API.LogError("Ошибка сохранения сообщения", "error", appErr.Error())
+		// Если не удалось сохранить, помечаем что файлы будут "сиротами"
+		// В Mattermost нет прямого удаления файлов через API
 		http.Error(w, appErr.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	p.API.LogInfo("Message scheduled successfully", 
+	p.API.LogInfo("Сообщение успешно запланировано", 
 		"id", msg.ID,
 		"user", msg.UserID,
 		"channel", msg.ChannelID,
-		"time", msg.ScheduleTime.Format("2006-01-02 15:04:05"))
+		"time", msg.ScheduleTime.Format("2006-01-02 15:04:05"),
+		"files", len(fileIDs))
 
-	p.sendNotification(msg.UserID, fmt.Sprintf("📅 Message scheduled for %s in ~%s", 
+	// Отправляем уведомление пользователю
+	fileInfo := ""
+	if len(filenames) > 0 {
+		fileInfo = fmt.Sprintf(" с %d вложением(ями)", len(filenames))
+	}
+	
+	p.sendNotification(msg.UserID, fmt.Sprintf("📅 Сообщение%s запланировано на %s в канале ~%s", 
+		fileInfo,
 		msg.ScheduleTime.Format("2006-01-02 15:04"),
 		channel.DisplayName))
 
+	// Отправляем ответ
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"id":      msg.ID,
 		"status":  "scheduled",
-		"message": "Message scheduled successfully",
+		"message": "Сообщение успешно запланировано",
 		"channel": channel.DisplayName,
 		"time":    msg.ScheduleTime.Format("2006-01-02 15:04"),
+		"files":   len(fileIDs),
 	})
 }
 
 func (p *Plugin) handleList(w http.ResponseWriter, r *http.Request) {
 	userID := r.URL.Query().Get("user_id")
 	if userID == "" {
-		http.Error(w, "user_id required", http.StatusBadRequest)
+		http.Error(w, "user_id обязателен", http.StatusBadRequest)
 		return
 	}
 
@@ -277,7 +362,7 @@ func (p *Plugin) handleList(w http.ResponseWriter, r *http.Request) {
 	
 	keys, appErr := p.API.KVList(0, 1000)
 	if appErr != nil {
-		p.API.LogError("Failed to list keys", "error", appErr.Error())
+		p.API.LogError("Ошибка получения списка ключей", "error", appErr.Error())
 		http.Error(w, appErr.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -303,7 +388,7 @@ func (p *Plugin) handleList(w http.ResponseWriter, r *http.Request) {
 
 func (p *Plugin) handleCancel(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -319,30 +404,35 @@ func (p *Plugin) handleCancel(w http.ResponseWriter, r *http.Request) {
 
 	data, appErr := p.API.KVGet(req.ID)
 	if appErr != nil || data == nil {
-		http.Error(w, "Message not found", http.StatusNotFound)
+		http.Error(w, "Сообщение не найдено", http.StatusNotFound)
 		return
 	}
 
 	var msg ScheduledMessage
 	if err := json.Unmarshal(data, &msg); err != nil {
-		http.Error(w, "Invalid message data", http.StatusInternalServerError)
+		http.Error(w, "Ошибка чтения данных сообщения", http.StatusInternalServerError)
 		return
 	}
 
 	if msg.UserID != req.UserID {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		http.Error(w, "Нет прав на отмену этого сообщения", http.StatusUnauthorized)
 		return
 	}
+
+	// В Mattermost нет прямого API для удаления файлов по ID
+	// Файлы будут удалены автоматически если не используются в постах
+	// или через админ-панель при очистке
 
 	if appErr := p.API.KVDelete(req.ID); appErr != nil {
 		http.Error(w, appErr.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	p.sendNotification(req.UserID, "❌ Scheduled message cancelled")
+	p.sendNotification(req.UserID, "❌ Запланированное сообщение отменено")
 
 	json.NewEncoder(w).Encode(map[string]string{
-		"status": "cancelled",
+		"status":  "cancelled",
+		"message": "Сообщение отменено. Файлы будут удалены системой позже.",
 	})
 }
 
@@ -355,7 +445,7 @@ func (p *Plugin) sendNotification(userID, message string) {
 	}
 
 	if _, appErr := p.API.CreatePost(post); appErr != nil {
-		p.API.LogError("Failed to send notification", 
+		p.API.LogError("Ошибка отправки уведомления", 
 			"user_id", userID, 
 			"error", appErr.Error())
 	}
@@ -380,7 +470,7 @@ func (p *Plugin) listScheduledMessages(userID string) (*model.CommandResponse, *
 	keys, appErr := p.API.KVList(0, 1000)
 	if appErr != nil {
 		return &model.CommandResponse{
-			Text: "Error listing messages",
+			Text: "Ошибка получения списка сообщений",
 		}, nil
 	}
 
@@ -402,16 +492,21 @@ func (p *Plugin) listScheduledMessages(userID string) (*model.CommandResponse, *
 
 	if len(messages) == 0 {
 		return &model.CommandResponse{
-			Text: "No scheduled messages found.",
+			Text: "У вас нет запланированных сообщений.",
 		}, nil
 	}
 
-	text := "### Your scheduled messages:\n"
+	text := "### Ваши запланированные сообщения:\n"
 	for _, msg := range messages {
-		text += fmt.Sprintf("- `%s` at %s in ~%s: %s\n", 
+		fileInfo := ""
+		if len(msg.Filenames) > 0 {
+			fileInfo = fmt.Sprintf(" 📎%d", len(msg.Filenames))
+		}
+		text += fmt.Sprintf("- `%s` в %s в ~%s%s: %s\n", 
 			msg.ID[:8],
 			msg.ScheduleTime.Format("2006-01-02 15:04"),
 			msg.ChannelName,
+			fileInfo,
 			msg.Message)
 	}
 
@@ -423,7 +518,7 @@ func (p *Plugin) listScheduledMessages(userID string) (*model.CommandResponse, *
 func (p *Plugin) cancelScheduledMessage(userID string, args []string) (*model.CommandResponse, *model.AppError) {
 	if len(args) < 2 {
 		return &model.CommandResponse{
-			Text: "Usage: /schedule_cancel <message_id>",
+			Text: "Использование: /schedule_cancel <id_сообщения>",
 		}, nil
 	}
 
@@ -431,28 +526,31 @@ func (p *Plugin) cancelScheduledMessage(userID string, args []string) (*model.Co
 	data, appErr := p.API.KVGet(msgID)
 	if appErr != nil || data == nil {
 		return &model.CommandResponse{
-			Text: "Message not found",
+			Text: "Сообщение не найдено",
 		}, nil
 	}
 
 	var msg ScheduledMessage
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return &model.CommandResponse{
-			Text: "Invalid message data",
+			Text: "Ошибка чтения данных сообщения",
 		}, nil
 	}
 
 	if msg.UserID != userID {
 		return &model.CommandResponse{
-			Text: "Unauthorized",
+			Text: "Нет прав на отмену этого сообщения",
 		}, nil
 	}
 
+	// В Mattermost нет прямого API для удаления файлов
+	// Файлы останутся в системе как неиспользуемые
+
 	p.API.KVDelete(msgID)
-	p.sendNotification(userID, "❌ Scheduled message cancelled")
+	p.sendNotification(userID, "❌ Запланированное сообщение отменено")
 
 	return &model.CommandResponse{
-		Text: "Message cancelled successfully",
+		Text: "Сообщение успешно отменено",
 	}, nil
 }
 
